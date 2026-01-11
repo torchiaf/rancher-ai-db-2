@@ -4,7 +4,6 @@ import logging
 
 from psycopg import AsyncConnection
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 from src.agent_client import get_chat_name
 from src.config import get_db_url, LOG_LEVEL, LOOP_R_CHATS_INTERVAL, LOOP_R_MESSAGES_INTERVAL
@@ -77,6 +76,14 @@ async def setup_database() -> AsyncConnection:
             )
         """)
         logger.info("Created/verified r_messages table")
+    
+    # Initialize LangGraph schema
+    try:
+        async with AsyncPostgresSaver.from_conn_string(get_db_url()) as checkpointer:
+            await checkpointer.setup()
+        logger.info("LangGraph schema initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize LangGraph schema: {e}", exc_info=True)
     
     return conn
 
