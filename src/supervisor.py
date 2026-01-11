@@ -34,18 +34,6 @@ async def setup_database() -> AsyncConnection:
         """)
         logger.info("Created/verified r_normalization_thread_queue table")
         
-        # Create normalization request queue table
-        await cur.execute("""
-            CREATE TABLE IF NOT EXISTS r_normalization_request_queue (
-                thread_id UUID NOT NULL,
-                request_id UUID NOT NULL,
-                processed BOOLEAN DEFAULT FALSE,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (thread_id, request_id)
-            );
-        """)
-        logger.info("Created/verified r_normalization_request_queue table")
-        
         # Create chats table
         await cur.execute("""
             CREATE TABLE IF NOT EXISTS r_chats (
@@ -182,29 +170,17 @@ async def sync_r_messages(
     
     checkpoint_data = checkpoint_tuple.checkpoint
     
-    # Walk through checkpoint chain to find all messages
-    all_messages = []
-    current_config = {"configurable": {"thread_id": thread_id, "request_id": request_id}}
-    visited = set()
+    # Get the ACTUAL request_id from checkpoint metadata (source of truth)
+    metadata = checkpoint_tuple.metadata or {}
+    actual_request_id = metadata.get("request_id")
     
-    while True:
-        if str(current_config) in visited:
-            break
-        visited.add(str(current_config))
-        
-        current_tuple = await saver.aget_tuple(current_config)
-        if not current_tuple:
-            break
-        
-        current_data = current_tuple.checkpoint
-        msgs = current_data.get("channel_values", {}).get("messages", [])
-        all_messages = msgs + all_messages
-        
-        if not current_tuple.parent_config:
-            break
-        current_config = current_tuple.parent_config
+    if actual_request_id:
+        request_id = actual_request_id
+        logger.debug(f"[sync_r_messages] Using checkpoint metadata request_id: {request_id}")
     
-    messages = all_messages
+    # Extract messages directly from this checkpoint (no chain walking)
+    # Each checkpoint contains the full message history at that point
+    messages = checkpoint_data.get("channel_values", {}).get("messages", [])
     
     # Extract fields from channel_values
     channel_values = checkpoint_data.get("channel_values", {})
@@ -229,8 +205,7 @@ async def sync_r_messages(
     else:
         prompt = str(prompt) if prompt else ""
     
-    # Extract tags from checkpoint metadata
-    metadata = checkpoint_tuple.metadata or {}
+    # Extract tags (already have metadata from above)
     tags = (metadata.get("tags") or 
             channel_values.get("tags"))
     
@@ -251,7 +226,14 @@ async def sync_r_messages(
         """
         INSERT INTO r_messages
         (request_id, chat_id, context, tags, user_message, mcp_responses, llm_response, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW()) ON CONFLICT (chat_id, request_id) DO NOTHING
+        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+        ON CONFLICT (chat_id, request_id) DO UPDATE SET
+        context = EXCLUDED.context,
+        tags = EXCLUDED.tags,
+        user_message = EXCLUDED.user_message,
+        mcp_responses = EXCLUDED.mcp_responses,
+        llm_response = EXCLUDED.llm_response,
+        updated_at = NOW()
         """,
         (request_id, thread_id, context, tags, prompt, mcp_res, llm_msg))
     logger.info(f"Synced message for thread_id: {thread_id}, request_id: {request_id}")
@@ -296,37 +278,44 @@ async def run_supervisor() -> None:
                 await asyncio.sleep(LOOP_R_CHATS_INTERVAL*2)
 
     async def message_sync_loop():
-        """Loop for syncing messages from request queue."""
+        """Loop for syncing messages directly from LangGraph checkpoints table."""
         logger.info("Starting message sync loop")
+        synced_requests = set()  # Track already-synced request_ids to avoid duplicates
+        
         while True:
             try:
                 async with conn.cursor() as cur:
-                    # Load unprocessed requests
+                    # Query the checkpoints table directly for checkpoints with request_id in metadata
                     await cur.execute("""
-                        SELECT thread_id, request_id, updated_at
-                        FROM r_normalization_request_queue
-                        WHERE processed = FALSE
-                        ORDER BY updated_at ASC
+                        SELECT DISTINCT
+                            thread_id,
+                            (metadata->>'request_id') as request_id
+                        FROM checkpoints
+                        WHERE metadata->>'request_id' IS NOT NULL
                     """)
                     rows = await cur.fetchall()
-                    request_pairs = [(row[0], row[1]) for row in rows]
-
-                    # Process all requests in the same cursor
-                    for thread_id, request_id in request_pairs:
-                        async with AsyncPostgresSaver.from_conn_string(conn_info) as saver:
-                            await sync_r_messages(cur, saver, str(thread_id), str(request_id))
-
-                        # Mark as processed
-                        await cur.execute("""
-                            UPDATE r_normalization_request_queue
-                            SET processed = TRUE
-                            WHERE thread_id = %s AND request_id = %s
-                        """, (thread_id, request_id))
-
+                    
+                    logger.debug(f"[message_sync_loop] Found {len(rows) if rows else 0} checkpoints to process")
+                    
+                    if rows:
+                        for thread_id, request_id in rows:
+                            # Skip if already synced in this session
+                            request_key = f"{thread_id}:{request_id}"
+                            if request_key in synced_requests:
+                                logger.debug(f"[message_sync_loop] Already synced: {request_key}")
+                                continue
+                            
+                            # Sync this message from the checkpoint
+                            logger.debug(f"[message_sync_loop] Syncing checkpoint: {request_key}")
+                            async with AsyncPostgresSaver.from_conn_string(conn_info) as saver:
+                                await sync_r_messages(cur, saver, str(thread_id), str(request_id))
+                            
+                            synced_requests.add(request_key)
+                
                 await asyncio.sleep(LOOP_R_MESSAGES_INTERVAL)
 
             except Exception as e:
-                logger.error(f"Error in message sync loop: {e}")
+                logger.error(f"Error in message sync loop: {e}", exc_info=True)
                 await asyncio.sleep(LOOP_R_MESSAGES_INTERVAL*2)
 
     # Run both loops concurrently
