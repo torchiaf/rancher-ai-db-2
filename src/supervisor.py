@@ -6,7 +6,14 @@ from psycopg import AsyncConnection
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from src.agent_client import get_chat_name
-from src.config import get_db_url, LOG_LEVEL, LOOP_R_CHATS_INTERVAL, LOOP_R_MESSAGES_INTERVAL
+from src.config import get_db_url, LOG_LEVEL, LOOP_R_CLEAN_SYNCED_CHECKPOINTS_INTERVAL, LOOP_R_MESSAGES_INTERVAL
+from src.utils import (
+    extract_messages,
+    extract_tags,
+    extract_context,
+    extract_mcp_responses,
+    convert_data_to_strings,
+)
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -19,8 +26,26 @@ async def setup_database() -> AsyncConnection:
     conn = await AsyncConnection.connect(conn_info, autocommit=True)
     
     logger.info(f"Connected to database at {conn_info}")
-    
+
+    # Initialize LangGraph schema
+    try:
+        async with AsyncPostgresSaver.from_conn_string(get_db_url()) as checkpointer:
+            await checkpointer.setup()
+        logger.info("LangGraph schema initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize LangGraph schema: {e}", exc_info=True)
+
     async with conn.cursor() as cur:
+        # Create checkpoint tracking table
+        await cur.execute("""
+            CREATE TABLE IF NOT EXISTS r_synced_checkpoints (
+                checkpoint_id VARCHAR(255) NOT NULL PRIMARY KEY,
+                request_id VARCHAR(255) NOT NULL,
+                synced_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """)
+        logger.info("Created/verified r_synced_checkpoints table")
+
         # Create chats table
         await cur.execute("""
             CREATE TABLE IF NOT EXISTS r_chats (
@@ -51,14 +76,6 @@ async def setup_database() -> AsyncConnection:
             )
         """)
         logger.info("Created/verified r_messages table")
-    
-    # Initialize LangGraph schema
-    try:
-        async with AsyncPostgresSaver.from_conn_string(get_db_url()) as checkpointer:
-            await checkpointer.setup()
-        logger.info("LangGraph schema initialized")
-    except Exception as e:
-        logger.error(f"Failed to initialize LangGraph schema: {e}", exc_info=True)
     
     return conn
 
@@ -125,128 +142,116 @@ async def sync_r_chats(
     active: bool,
 ) -> None:
     """
-    Fetch chat info and sync to r_chats table.
-    - If chat is active: set it as active, deactivate other chats
-      - If NEW chat: generate default name
-      - If EXISTING chat: preserve existing name
-    - If chat is inactive: just mark it as inactive, preserve existing name
-      - Fire-and-forget: Generate name asynchronously via get_chat_name
+    Assign a name to inactive chats
     """
-
-    if active:
-        # Deactivate other chats for this user
-        await cur.execute(
-            """
-            UPDATE r_chats
-            SET active = FALSE, updated_at = NOW()
-            WHERE user_id = %s AND chat_id != %s
-            """,
-            (user_id, thread_id)
-        )
-        logger.debug(f"Deactivated other chats for user {user_id}")
-        
-    await cur.execute(
-        "SELECT name FROM r_chats WHERE chat_id = %s AND user_id = %s",
-        (thread_id, user_id)
-    )
-    existing = await cur.fetchone()
-
-    if existing and existing[0]:
-        name = existing[0]
-        logger.debug(f"Existing chat found for thread_id: {thread_id}, preserving name: '{name}'")
-    else:
-        await cur.execute("SELECT NOW()::timestamp")
-        now_row = await cur.fetchone()
-        if now_row:
-            name = now_row[0].strftime("Chat %Y-%m-%d %H:%M:%S")
-
-    await cur.execute(
-        """
-        INSERT INTO r_chats (chat_id, user_id, active, name, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, NOW(), NOW())
-        ON CONFLICT (chat_id, user_id) DO UPDATE SET
-        active = EXCLUDED.active,
-        name = EXCLUDED.name,
-        updated_at = NOW()
-        """,
-        (thread_id, user_id, active, name))
-    logger.info(f"Synced chat for thread_id: {thread_id}, user_id: {user_id}, active: {active}, name: '{name}'")
-
-    # TODO
-    # if not active:
-    #     asyncio.create_task(update_chat_name_async(thread_id, user_id))
 
 async def sync_r_messages(
     cur,
-    saver: AsyncPostgresSaver,
     thread_id: str,
     request_id: str,
+    checkpoint_id: str,
+    checkpoint_raw,
+    metadata_raw,
 ) -> None:
     """
-    Fetch messages from LangGraph checkpoints and sync to r_messages table.
+    Fetch messages from checkpoint_writes (msgpack+pickle) and sync to r_messages table.
+    checkpoint_raw and metadata_raw are passed from the loop query to avoid a second SELECT.
     """
     
-    # Fetch checkpoint data using saver which handles deserialization
-    config = {"configurable": {"thread_id": thread_id, "request_id": request_id}}
-    checkpoint_tuple = await saver.aget_tuple(config)
+    logger.info(f"[sync_r_messages] Processing checkpoint_id={checkpoint_id}")
     
-    if not checkpoint_tuple:
-        logger.warning(f"No checkpoint found for thread: {thread_id}")
+    try:
+        checkpoint_data = checkpoint_raw if isinstance(checkpoint_raw, dict) else json.loads(checkpoint_raw)
+        metadata = json.loads(metadata_raw) if isinstance(metadata_raw, str) else (metadata_raw or {})
+        step = metadata.get('step', '?')
+        logger.debug(f"[sync_r_messages] Loaded checkpoint: checkpoint_id={checkpoint_id}, step={step}")
+    except Exception as e:
+        logger.error(f"Failed to deserialize checkpoint: {e}")
         return
     
-    checkpoint_data = checkpoint_tuple.checkpoint
-    
-    # Get the ACTUAL request_id from checkpoint metadata (source of truth)
-    metadata = checkpoint_tuple.metadata or {}
-    actual_request_id = metadata.get("request_id")
-    
-    if actual_request_id:
-        request_id = actual_request_id
-        logger.debug(f"[sync_r_messages] Using checkpoint metadata request_id: {request_id}")
-    
-    # Extract messages directly from this checkpoint (no chain walking)
-    # Each checkpoint contains the full message history at that point
-    messages = checkpoint_data.get("channel_values", {}).get("messages", [])
-    
-    # Extract fields from channel_values
     channel_values = checkpoint_data.get("channel_values", {})
-    context = channel_values.get("context", "")
     prompt = channel_values.get("prompt", "")
-    mcp_responses_list = channel_values.get("mcp_responses", [])
+    logger.debug(f"[sync_r_messages] Channel values keys: {list(channel_values.keys())}")
+
+    logger.debug(f"[sync_r_messages] Querying checkpoint_writes for checkpoint_id={checkpoint_id}")
+    await cur.execute("""
+        SELECT cw.channel, cw.blob
+        FROM checkpoint_writes cw
+        WHERE cw.checkpoint_id = %s
+        ORDER BY cw.channel
+    """, (checkpoint_id,))
     
-    # Convert mcp_responses list to string
-    if isinstance(mcp_responses_list, list):
-        mcp_res = " ".join(mcp_responses_list) if mcp_responses_list else ""
-    else:
-        mcp_res = str(mcp_responses_list) if mcp_responses_list else ""
+    all_rows = await cur.fetchall()
+    logger.info(f"[sync_r_messages] Found {len(all_rows)} checkpoint_writes rows for checkpoint_id={checkpoint_id}")
     
-    # Convert to strings if they're dicts
-    if isinstance(context, dict):
-        context = json.dumps(context)
-    else:
-        context = str(context) if context else ""
+    messages_blob = None
+    tags_blob = None
+    context_blob = None
+    mcp_blob = None
     
-    if isinstance(prompt, dict):
-        prompt = json.dumps(prompt)
-    else:
-        prompt = str(prompt) if prompt else ""
-    
-    # Extract tags (already have metadata from above)
-    tags = (metadata.get("tags") or 
-            channel_values.get("tags"))
-    
-    # Extract message types by looking at message type attribute
-    llm_msg = ""
-    
-    for msg in messages:
-        msg_type = getattr(msg, "type", None)
-        msg_content = getattr(msg, "content", "")
+    for channel, blob in all_rows:
+        logger.info(f"[sync_r_messages] Processing channel='{channel}', blob_size={len(blob) if blob else 0} bytes")
         
-        if msg_type == "ai":
-            llm_msg = msg_content
+        if blob:
+            try:
+                import msgpack
+                deserialized = msgpack.unpackb(blob, raw=False)
+                logger.info(f"[sync_r_messages] Deserialized '{channel}': type={type(deserialized).__name__}, content_preview={str(deserialized)[:200]}")
+            except Exception as e:
+                logger.error(f"[sync_r_messages] Failed to deserialize '{channel}': {e}")
+
+        if channel == 'messages':
+            messages_blob = blob
+        elif channel == 'tags':
+            tags_blob = blob
+        elif channel == 'context':
+            context_blob = blob
+        elif channel == 'mcp_responses':
+            mcp_blob = blob
     
-    if not prompt:
-        logger.warning(f"No prompt/user message found in checkpoint for request_id {request_id}")
+    logger.debug(f"[sync_r_messages] Blob assignment: messages={messages_blob is not None}, tags={tags_blob is not None}, context={context_blob is not None}, mcp={mcp_blob is not None}")
+
+    logger.debug(f"[sync_r_messages] Extracting messages...")
+    user_msg, llm_msg = extract_messages(messages_blob)
+    logger.debug(f"[sync_r_messages] Extracted messages: user_msg_len={len(user_msg) if user_msg else 0}, llm_msg_len={len(llm_msg) if llm_msg else 0}")
+    logger.info(f"[sync_r_messages] llm response: {repr(llm_msg[:200] if llm_msg else 'EMPTY')}")
+    
+    logger.debug(f"[sync_r_messages] Extracting tags...")
+    tags = extract_tags(tags_blob)
+    logger.debug(f"[sync_r_messages] Extracted tags: {tags}")
+    
+    logger.debug(f"[sync_r_messages] Extracting context...")
+    context = extract_context(context_blob)
+    logger.debug(f"[sync_r_messages] Extracted context keys: {list(context.keys()) if context else 'empty'}")
+    
+    logger.debug(f"[sync_r_messages] Extracting mcp_responses...")
+    mcp_responses_list = extract_mcp_responses(mcp_blob)
+    logger.debug(f"[sync_r_messages] Extracted mcp_responses: {len(mcp_responses_list)} items")
+    
+    logger.debug(f"[sync_r_messages] Prompt from checkpoint: {len(str(prompt))} chars")
+    
+    # Fallback to prompt if no user message found
+    if not user_msg and prompt:
+        user_msg = prompt
+        logger.debug(f"[sync_r_messages] No user_msg extracted, using prompt fallback: {len(user_msg)} chars")
+    
+    # Convert data to final string formats
+    logger.debug(f"[sync_r_messages] Converting data to database formats...")
+    context_str, tags_list, mcp_res = convert_data_to_strings(
+        user_msg, llm_msg, mcp_responses_list, context, tags
+    )
+    logger.debug(f"[sync_r_messages] Conversion complete:")
+    logger.debug(f"  - context_str: {len(context_str)} chars")
+    logger.debug(f"  - tags_list: {tags_list}")
+    logger.debug(f"  - mcp_res: {len(mcp_res)} chars")
+    
+    logger.info(f"[sync_r_messages] FINAL RESULT: step={step}, user_len={len(user_msg)}, llm_len={len(llm_msg)}, tags={tags_list}, context_len={len(context_str)}, mcp_len={len(mcp_res)}")
+
+    # Convert empty strings to None so COALESCE treats them as NULL in the database
+    context_val = context_str if context_str else None
+    user_val = user_msg if user_msg else None
+    llm_val = llm_msg if llm_msg else None
+    mcp_val = mcp_res if mcp_res else None
 
     await cur.execute(
         """
@@ -254,15 +259,14 @@ async def sync_r_messages(
         (request_id, chat_id, context, tags, user_message, mcp_responses, llm_response, created_at, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
         ON CONFLICT (chat_id, request_id) DO UPDATE SET
-        context = EXCLUDED.context,
-        tags = EXCLUDED.tags,
-        user_message = EXCLUDED.user_message,
-        mcp_responses = EXCLUDED.mcp_responses,
-        llm_response = EXCLUDED.llm_response,
+        context = COALESCE(EXCLUDED.context, r_messages.context),
+        tags = COALESCE(EXCLUDED.tags, r_messages.tags),
+        user_message = COALESCE(EXCLUDED.user_message, r_messages.user_message),
+        mcp_responses = COALESCE(EXCLUDED.mcp_responses, r_messages.mcp_responses),
+        llm_response = COALESCE(EXCLUDED.llm_response, r_messages.llm_response),
         updated_at = NOW()
         """,
-        (request_id, thread_id, context, tags, prompt, mcp_res, llm_msg))
-    logger.info(f"Synced message for thread_id: {thread_id}, request_id: {request_id}")
+        (request_id, thread_id, context_val, tags_list, user_val, mcp_val, llm_val))
 
 async def run_supervisor() -> None:
     """
@@ -270,44 +274,19 @@ async def run_supervisor() -> None:
     """
     conn = await setup_database()
     conn_info = get_db_url()
+
     # async def chat_sync_loop():
     #     """
     #     Loop for syncing chats from thread queue.
     #     Picks up both unprocessed rows and recently updated rows.
     #     """
     #     logger.info("Starting chat sync loop")
-    #     last_sync_time = "1970-01-01 00:00:00"
         
     #     while True:
     #         try:
     #             async with conn.cursor() as cur:
-    #                 # Load unprocessed rows OR rows updated since last sync
-    #                 await cur.execute("""
-    #                     SELECT thread_id, user_id, active, updated_at
-    #                     FROM r_normalization_thread_queue
-    #                     WHERE processed = FALSE OR updated_at > %s::timestamp
-    #                     ORDER BY updated_at ASC
-    #                 """, (last_sync_time,))
-                    
-    #                 rows = await cur.fetchall()
-    #                 thread_ids = [(row[0], row[1], row[2]) for row in rows]
 
-    #                 # Process all threads in the same cursor
-    #                 for thread_id, user_id, active in thread_ids:
-    #                     await sync_r_chats(cur, str(thread_id), user_id, active)
-
-    #                     # Mark as processed
-    #                     await cur.execute("""
-    #                         UPDATE r_normalization_thread_queue
-    #                         SET processed = TRUE
-    #                         WHERE thread_id = %s
-    #                     """, (thread_id,))
-                    
-    #                 # Get current DB time for next iteration
-    #                 await cur.execute("SELECT NOW()::timestamp")
-    #                 last_sync_row = await cur.fetchone()
-    #                 if last_sync_row:
-    #                     last_sync_time = last_sync_row[0]
+    #             # TODO assign a name to history chats if missing
                 
     #             await asyncio.sleep(LOOP_R_CHATS_INTERVAL)
 
@@ -315,42 +294,81 @@ async def run_supervisor() -> None:
     #             logger.error(f"Error in chat sync loop: {e}")
     #             await asyncio.sleep(LOOP_R_CHATS_INTERVAL*2)
 
-    async def message_sync_loop():
+    async def cleanup_synced_checkpoints_loop():
         """
-        Loop for syncing messages directly from LangGraph checkpoints table.
+        Periodically clean up r_synced_checkpoints for chats that no longer exist.
         """
-        logger.info("Starting message sync loop")
-        synced_requests = set()
+        logger.info("Starting cleanup loop for synced checkpoints")
         
         while True:
             try:
                 async with conn.cursor() as cur:
-                    # Query the checkpoints table directly for checkpoints with request_id in metadata
+                    # Delete checkpoints for chats that don't exist in r_chats
                     await cur.execute("""
-                        SELECT DISTINCT
-                            thread_id,
-                            (metadata->>'request_id') as request_id
-                        FROM checkpoints
-                        WHERE metadata->>'request_id' IS NOT NULL
+                        DELETE FROM r_synced_checkpoints rsc
+                        WHERE rsc.request_id IN (
+                            SELECT DISTINCT rm.request_id
+                            FROM r_messages rm
+                            WHERE rm.chat_id NOT IN (SELECT chat_id FROM r_chats)
+                        )
                     """)
+                    deleted = cur.rowcount
+                    if deleted > 0:
+                        logger.debug(f"[cleanup_synced_checkpoints_loop] Deleted {deleted} stale checkpoint tracking records")
+                    
+                await asyncio.sleep(LOOP_R_CLEAN_SYNCED_CHECKPOINTS_INTERVAL)
+            except Exception as e:
+                logger.error(f"Error in cleanup loop: {e}", exc_info=True)
+                await asyncio.sleep(LOOP_R_CLEAN_SYNCED_CHECKPOINTS_INTERVAL * 2)
+
+    async def message_sync_loop():
+        """
+        Loop for syncing messages from LangGraph checkpoints table.
+        Tracks processed checkpoints to avoid re-processing.
+        """
+        logger.info("Starting message sync loop")
+        
+        while True:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        SELECT DISTINCT
+                            c.thread_id,
+                            c.checkpoint_id,
+                            (c.metadata->>'request_id') as request_id,
+                            c.checkpoint,
+                            c.metadata
+                        FROM checkpoint_writes cw
+                        JOIN checkpoints c ON cw.checkpoint_id = c.checkpoint_id
+                        WHERE cw.checkpoint_id NOT IN (SELECT checkpoint_id FROM r_synced_checkpoints)
+                          AND c.metadata->>'request_id' IS NOT NULL
+                        ORDER BY c.checkpoint_id
+                        """
+                    )
                     rows = await cur.fetchall()
                     
-                    # logger.debug(f"[message_sync_loop] Found {len(rows) if rows else 0} checkpoints to process")
-                    
                     if rows:
-                        for thread_id, request_id in rows:
-                            # Skip if already synced in this session
-                            request_key = f"{thread_id}:{request_id}"
-                            if request_key in synced_requests:
-                                # logger.debug(f"[message_sync_loop] Already synced: {request_key}")
-                                continue
-                            
-                            # Sync this message from the checkpoint
-                            logger.debug(f"[message_sync_loop] Syncing checkpoint: {request_key}")
-                            async with AsyncPostgresSaver.from_conn_string(conn_info) as saver:
-                                await sync_r_messages(cur, saver, str(thread_id), str(request_id))
-                            
-                            synced_requests.add(request_key)
+                        logger.debug(f"[message_sync_loop] Found {len(rows)} new checkpoints in checkpoint_writes")
+                    else:
+                        logger.debug(f"[message_sync_loop] Found 0 new checkpoints")
+                    
+                    # Process each checkpoint found
+                    for thread_id, checkpoint_id, request_id, checkpoint_raw, metadata_raw in rows:
+
+                        logger.info(f"[message_sync_loop] Processing new checkpoint: {checkpoint_id}, request_id={request_id}")
+                        await sync_r_messages(cur, str(thread_id), str(request_id), str(checkpoint_id), checkpoint_raw, metadata_raw)
+                        
+                        # Mark as synced
+                        await cur.execute(
+                            """
+                            INSERT INTO r_synced_checkpoints (checkpoint_id, request_id, synced_at)
+                            VALUES (%s, %s, NOW())
+                            ON CONFLICT (checkpoint_id) DO NOTHING
+                            """,
+                            (str(checkpoint_id), str(request_id))
+                        )
+                        logger.debug(f"[message_sync_loop] Marked checkpoint as synced: {checkpoint_id}")
                 
                 await asyncio.sleep(LOOP_R_MESSAGES_INTERVAL)
 
@@ -359,7 +377,10 @@ async def run_supervisor() -> None:
                 await asyncio.sleep(LOOP_R_MESSAGES_INTERVAL*2)
 
     # Run both loops concurrently
-    await asyncio.gather(message_sync_loop())
+    await asyncio.gather(
+        message_sync_loop(),
+        cleanup_synced_checkpoints_loop(),
+    )
 
 if __name__ == "__main__":
     asyncio.run(run_supervisor())
