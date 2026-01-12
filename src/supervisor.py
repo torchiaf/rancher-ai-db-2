@@ -99,6 +99,38 @@ async def get_chat_messages(chat_id: str, max_count: int = 5) -> list[str]:
     finally:
         await conn.close()
 
+async def update_chat_name_async(thread_id: str, user_id: str) -> None:
+    """
+    Fire-and-forget task: Generate chat name and update r_chats table.
+    Called when a chat is deactivated.
+    """
+    try:
+        messages = await get_chat_messages(thread_id)
+        if not messages:
+            logger.debug(f"No messages found for chat {thread_id}, skipping name generation")
+            return
+
+        generated_name = await get_chat_name(thread_id, messages)
+
+        if generated_name:
+            conn_str = get_db_url()
+            conn = await AsyncConnection.connect(conn_str, autocommit=True)
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        UPDATE r_chats
+                        SET name = %s, updated_at = NOW()
+                        WHERE chat_id = %s AND user_id = %s
+                        """,
+                        (generated_name, thread_id, user_id)
+                    )
+                    logger.info(f"Updated chat name for deactivated chat {thread_id}: '{generated_name}'")
+            finally:
+                await conn.close()
+    except Exception as e:
+        logger.error(f"Error updating chat name for {thread_id}: {e}", exc_info=True)
+
 async def sync_r_chats(
     cur,
     thread_id: str,
@@ -107,48 +139,54 @@ async def sync_r_chats(
 ) -> None:
     """
     Fetch chat info and sync to r_chats table.
-    If chat is being set to inactive and has no name, generate one from ws/summary.
+    - If chat is active: set it as active, deactivate other chats
+      - If NEW chat: generate default name
+      - If EXISTING chat: preserve existing name
+    - If chat is inactive: just mark it as inactive, preserve existing name
+      - Fire-and-forget: Generate name asynchronously via get_chat_name
     """
 
-    name = ""
-
-    # If chat is being deactivated and has no name, generate one
-    if not active:
+    if active:
+        # Deactivate other chats for this user
         await cur.execute(
-            "SELECT active, name, created_at FROM r_chats WHERE chat_id = %s AND user_id = %s",
-            (thread_id, user_id)
+            """
+            UPDATE r_chats
+            SET active = FALSE, updated_at = NOW()
+            WHERE user_id = %s AND chat_id != %s
+            """,
+            (user_id, thread_id)
         )
-        existing = await cur.fetchone()
+        logger.debug(f"Deactivated other chats for user {user_id}")
         
-        if existing and existing[0] == True and existing[1] == "":
-            # The chat is about to be deactivated and has no name
-            logger.info(f"Assigning name to chat {thread_id}")
-            
-            messages = await get_chat_messages(thread_id)
-            if len(messages) > 0:
-                try:
-                    name = await get_chat_name(thread_id, messages) or ""
-                except Exception as e:
-                    logger.debug(f"Failed to obtain name from websocket summary service: {e}")
-                    name = existing[2].strftime("Chat %Y-%m-%d %H:%M:%S")
-            else:
-                logger.debug(f"No messages found for chat_id: {thread_id}, using empty name")
+    await cur.execute(
+        "SELECT name FROM r_chats WHERE chat_id = %s AND user_id = %s",
+        (thread_id, user_id)
+    )
+    existing = await cur.fetchone()
 
-            logger.info(f"Generated name: '{name}'")
-        elif existing:
-            name = existing[1]
-    
+    if existing and existing[0]:
+        name = existing[0]
+        logger.debug(f"Existing chat found for thread_id: {thread_id}, preserving name: '{name}'")
+    else:
+        await cur.execute("SELECT NOW()::timestamp")
+        now_row = await cur.fetchone()
+        if now_row:
+            name = now_row[0].strftime("Chat %Y-%m-%d %H:%M:%S")
+
     await cur.execute(
         """
         INSERT INTO r_chats (chat_id, user_id, active, name, created_at, updated_at)
         VALUES (%s, %s, %s, %s, NOW(), NOW())
         ON CONFLICT (chat_id, user_id) DO UPDATE SET
         active = EXCLUDED.active,
-        name = CASE WHEN EXCLUDED.name != '' THEN EXCLUDED.name ELSE r_chats.name END,
+        name = EXCLUDED.name,
         updated_at = NOW()
         """,
         (thread_id, user_id, active, name))
-    logger.info(f"Synced chat for thread_id: {thread_id}, user_id: {user_id}, name: '{name}'")
+    logger.info(f"Synced chat for thread_id: {thread_id}, user_id: {user_id}, active: {active}, name: '{name}'")
+
+    if not active:
+        asyncio.create_task(update_chat_name_async(thread_id, user_id))
 
 async def sync_r_messages(
     cur,
@@ -245,18 +283,24 @@ async def run_supervisor() -> None:
     conn = await setup_database()
     conn_info = get_db_url()
     async def chat_sync_loop():
-        """Loop for syncing chats from thread queue."""
+        """
+        Loop for syncing chats from thread queue.
+        Picks up both unprocessed rows and recently updated rows.
+        """
         logger.info("Starting chat sync loop")
+        last_sync_time = "1970-01-01 00:00:00"
+        
         while True:
             try:
                 async with conn.cursor() as cur:
-                    # Load unprocessed thread_ids
+                    # Load unprocessed rows OR rows updated since last sync
                     await cur.execute("""
                         SELECT thread_id, user_id, active, updated_at
                         FROM r_normalization_thread_queue
-                        WHERE processed = FALSE
+                        WHERE processed = FALSE OR updated_at > %s::timestamp
                         ORDER BY updated_at ASC
-                    """)
+                    """, (last_sync_time,))
+                    
                     rows = await cur.fetchall()
                     thread_ids = [(row[0], row[1], row[2]) for row in rows]
 
@@ -270,6 +314,12 @@ async def run_supervisor() -> None:
                             SET processed = TRUE
                             WHERE thread_id = %s
                         """, (thread_id,))
+                    
+                    # Get current DB time for next iteration
+                    await cur.execute("SELECT NOW()::timestamp")
+                    last_sync_row = await cur.fetchone()
+                    if last_sync_row:
+                        last_sync_time = last_sync_row[0]
                 
                 await asyncio.sleep(LOOP_R_CHATS_INTERVAL)
 
@@ -278,9 +328,11 @@ async def run_supervisor() -> None:
                 await asyncio.sleep(LOOP_R_CHATS_INTERVAL*2)
 
     async def message_sync_loop():
-        """Loop for syncing messages directly from LangGraph checkpoints table."""
+        """
+        Loop for syncing messages directly from LangGraph checkpoints table.
+        """
         logger.info("Starting message sync loop")
-        synced_requests = set()  # Track already-synced request_ids to avoid duplicates
+        synced_requests = set()
         
         while True:
             try:
@@ -295,14 +347,14 @@ async def run_supervisor() -> None:
                     """)
                     rows = await cur.fetchall()
                     
-                    logger.debug(f"[message_sync_loop] Found {len(rows) if rows else 0} checkpoints to process")
+                    # logger.debug(f"[message_sync_loop] Found {len(rows) if rows else 0} checkpoints to process")
                     
                     if rows:
                         for thread_id, request_id in rows:
                             # Skip if already synced in this session
                             request_key = f"{thread_id}:{request_id}"
                             if request_key in synced_requests:
-                                logger.debug(f"[message_sync_loop] Already synced: {request_key}")
+                                # logger.debug(f"[message_sync_loop] Already synced: {request_key}")
                                 continue
                             
                             # Sync this message from the checkpoint
