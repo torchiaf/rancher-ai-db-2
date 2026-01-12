@@ -21,19 +21,6 @@ async def setup_database() -> AsyncConnection:
     logger.info(f"Connected to database at {conn_info}")
     
     async with conn.cursor() as cur:
-        # Create normalization thread queue table
-        await cur.execute("""
-            CREATE TABLE IF NOT EXISTS r_normalization_thread_queue (
-                thread_id UUID NOT NULL,
-                user_id VARCHAR(10) NOT NULL,
-                active BOOLEAN DEFAULT TRUE,
-                processed BOOLEAN DEFAULT FALSE,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (thread_id, user_id)
-            );
-        """)
-        logger.info("Created/verified r_normalization_thread_queue table")
-        
         # Create chats table
         await cur.execute("""
             CREATE TABLE IF NOT EXISTS r_chats (
@@ -283,50 +270,50 @@ async def run_supervisor() -> None:
     """
     conn = await setup_database()
     conn_info = get_db_url()
-    async def chat_sync_loop():
-        """
-        Loop for syncing chats from thread queue.
-        Picks up both unprocessed rows and recently updated rows.
-        """
-        logger.info("Starting chat sync loop")
-        last_sync_time = "1970-01-01 00:00:00"
+    # async def chat_sync_loop():
+    #     """
+    #     Loop for syncing chats from thread queue.
+    #     Picks up both unprocessed rows and recently updated rows.
+    #     """
+    #     logger.info("Starting chat sync loop")
+    #     last_sync_time = "1970-01-01 00:00:00"
         
-        while True:
-            try:
-                async with conn.cursor() as cur:
-                    # Load unprocessed rows OR rows updated since last sync
-                    await cur.execute("""
-                        SELECT thread_id, user_id, active, updated_at
-                        FROM r_normalization_thread_queue
-                        WHERE processed = FALSE OR updated_at > %s::timestamp
-                        ORDER BY updated_at ASC
-                    """, (last_sync_time,))
+    #     while True:
+    #         try:
+    #             async with conn.cursor() as cur:
+    #                 # Load unprocessed rows OR rows updated since last sync
+    #                 await cur.execute("""
+    #                     SELECT thread_id, user_id, active, updated_at
+    #                     FROM r_normalization_thread_queue
+    #                     WHERE processed = FALSE OR updated_at > %s::timestamp
+    #                     ORDER BY updated_at ASC
+    #                 """, (last_sync_time,))
                     
-                    rows = await cur.fetchall()
-                    thread_ids = [(row[0], row[1], row[2]) for row in rows]
+    #                 rows = await cur.fetchall()
+    #                 thread_ids = [(row[0], row[1], row[2]) for row in rows]
 
-                    # Process all threads in the same cursor
-                    for thread_id, user_id, active in thread_ids:
-                        await sync_r_chats(cur, str(thread_id), user_id, active)
+    #                 # Process all threads in the same cursor
+    #                 for thread_id, user_id, active in thread_ids:
+    #                     await sync_r_chats(cur, str(thread_id), user_id, active)
 
-                        # Mark as processed
-                        await cur.execute("""
-                            UPDATE r_normalization_thread_queue
-                            SET processed = TRUE
-                            WHERE thread_id = %s
-                        """, (thread_id,))
+    #                     # Mark as processed
+    #                     await cur.execute("""
+    #                         UPDATE r_normalization_thread_queue
+    #                         SET processed = TRUE
+    #                         WHERE thread_id = %s
+    #                     """, (thread_id,))
                     
-                    # Get current DB time for next iteration
-                    await cur.execute("SELECT NOW()::timestamp")
-                    last_sync_row = await cur.fetchone()
-                    if last_sync_row:
-                        last_sync_time = last_sync_row[0]
+    #                 # Get current DB time for next iteration
+    #                 await cur.execute("SELECT NOW()::timestamp")
+    #                 last_sync_row = await cur.fetchone()
+    #                 if last_sync_row:
+    #                     last_sync_time = last_sync_row[0]
                 
-                await asyncio.sleep(LOOP_R_CHATS_INTERVAL)
+    #             await asyncio.sleep(LOOP_R_CHATS_INTERVAL)
 
-            except Exception as e:
-                logger.error(f"Error in chat sync loop: {e}")
-                await asyncio.sleep(LOOP_R_CHATS_INTERVAL*2)
+    #         except Exception as e:
+    #             logger.error(f"Error in chat sync loop: {e}")
+    #             await asyncio.sleep(LOOP_R_CHATS_INTERVAL*2)
 
     async def message_sync_loop():
         """
@@ -372,7 +359,7 @@ async def run_supervisor() -> None:
                 await asyncio.sleep(LOOP_R_MESSAGES_INTERVAL*2)
 
     # Run both loops concurrently
-    await asyncio.gather(chat_sync_loop(), message_sync_loop())
+    await asyncio.gather(message_sync_loop())
 
 if __name__ == "__main__":
     asyncio.run(run_supervisor())
