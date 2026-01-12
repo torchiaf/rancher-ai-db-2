@@ -263,7 +263,7 @@ async def sync_r_messages(
         tags = COALESCE(EXCLUDED.tags, r_messages.tags),
         user_message = COALESCE(EXCLUDED.user_message, r_messages.user_message),
         mcp_responses = COALESCE(EXCLUDED.mcp_responses, r_messages.mcp_responses),
-        llm_response = COALESCE(EXCLUDED.llm_response, r_messages.llm_response),
+        llm_response = CASE WHEN r_messages.llm_response IS NOT NULL THEN r_messages.llm_response ELSE EXCLUDED.llm_response END,
         updated_at = NOW()
         """,
         (request_id, thread_id, context_val, tags_list, user_val, mcp_val, llm_val))
