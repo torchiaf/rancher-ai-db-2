@@ -379,7 +379,6 @@ async def run_supervisor() -> None:
     # Run both loops concurrently
     await asyncio.gather(
         message_sync_loop(),
-        cleanup_synced_checkpoints_loop(),
     )
 
 if __name__ == "__main__":
