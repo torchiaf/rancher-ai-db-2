@@ -185,8 +185,9 @@ async def sync_r_chats(
         (thread_id, user_id, active, name))
     logger.info(f"Synced chat for thread_id: {thread_id}, user_id: {user_id}, active: {active}, name: '{name}'")
 
-    if not active:
-        asyncio.create_task(update_chat_name_async(thread_id, user_id))
+    # TODO
+    # if not active:
+    #     asyncio.create_task(update_chat_name_async(thread_id, user_id))
 
 async def sync_r_messages(
     cur,
